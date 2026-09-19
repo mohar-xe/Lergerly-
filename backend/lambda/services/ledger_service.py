@@ -209,7 +209,7 @@ class LedgerService:
     # 3. list_customers()
     # -------------------------------------------------------------------------
     def list_customers(self, shop_id: str) -> List[Dict[str, Any]]:
-        """Lists all customers belonging to a shop."""
+        """Lists all customers belonging to a shop. Handles pagination (1MB limit)."""
         if not shop_id or not shop_id.strip():
             raise LedgerValidationError("shopId must not be empty")
 
@@ -217,9 +217,21 @@ class LedgerService:
         scan_kwargs = {}
         if Attr is not None:
             scan_kwargs["FilterExpression"] = Attr("shopId").eq(shop_id.strip())
-        response = self._wrap_db_call(table.scan, **scan_kwargs)
-        items = response.get("Items", [])
-        return _to_serializable(items)
+        # Paginated scan to avoid 1MB truncation
+        all_items: List[Dict[str, Any]] = []
+        last_key = None
+        while True:
+            if last_key:
+                scan_kwargs["ExclusiveStartKey"] = last_key
+            elif "ExclusiveStartKey" in scan_kwargs:
+                scan_kwargs.pop("ExclusiveStartKey", None)
+            response = self._wrap_db_call(table.scan, **scan_kwargs)
+            items = response.get("Items", [])
+            all_items.extend(items)
+            last_key = response.get("LastEvaluatedKey")
+            if not last_key:
+                break
+        return _to_serializable(all_items)
 
     # -------------------------------------------------------------------------
     # 4. get_customer_transactions()
@@ -227,7 +239,7 @@ class LedgerService:
     def get_customer_transactions(
         self, customer_id: str, shop_id: Optional[str] = None
     ) -> List[Dict[str, Any]]:
-        """Retrieves all transaction records for a given customer."""
+        """Retrieves all transaction records for a given customer. Handles pagination."""
         if not customer_id or not customer_id.strip():
             raise LedgerValidationError("customerId must not be empty")
 
@@ -239,10 +251,21 @@ class LedgerService:
                 filter_expr = filter_expr & Attr("shopId").eq(shop_id.strip())
             scan_kwargs["FilterExpression"] = filter_expr
 
-        response = self._wrap_db_call(table.scan, **scan_kwargs)
-        items = response.get("Items", [])
-        items.sort(key=lambda x: str(x.get("createdAt", "")), reverse=True)
-        return _to_serializable(items)
+        all_items: List[Dict[str, Any]] = []
+        last_key = None
+        while True:
+            if last_key:
+                scan_kwargs["ExclusiveStartKey"] = last_key
+            elif "ExclusiveStartKey" in scan_kwargs:
+                scan_kwargs.pop("ExclusiveStartKey", None)
+            response = self._wrap_db_call(table.scan, **scan_kwargs)
+            items = response.get("Items", [])
+            all_items.extend(items)
+            last_key = response.get("LastEvaluatedKey")
+            if not last_key:
+                break
+        all_items.sort(key=lambda x: str(x.get("createdAt", "")), reverse=True)
+        return _to_serializable(all_items)
 
     # -------------------------------------------------------------------------
     # 4b. get_transaction() - Point lookup by transactionId primary key

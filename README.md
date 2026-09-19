@@ -1,4 +1,4 @@
-# Ledgerly
+# Ledgerly 💔
 
 Ledgerly is an AI-powered digital ledger designed to help local shopkeepers manage customer credit, payments, and outstanding balances via WhatsApp voice notes and text.
 

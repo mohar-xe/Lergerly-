@@ -42,6 +42,12 @@ class BedrockExtractionError(BedrockError):
     pass
 
 
+DEMO_LANGUAGES = ["en-IN", "hi-IN", "bn-IN", "mr-IN", "ta-IN", "te-IN"]
+DEMO_LANGUAGE_LABELS = {
+    "en-IN": "English (en)", "hi-IN": "Hindi (hi, हिन्दी)", "bn-IN": "Bengali (bn, বাংলা)",
+    "mr-IN": "Marathi (mr, मराठी)", "ta-IN": "Tamil (ta, தமிழ்)", "te-IN": "Telugu (te, తెలుగు)",
+}
+# Full 23-language list retained for future expansion (not active in demo)
 INDIAN_LANGUAGES = [
     "Assamese (as, অসমীয়া)", "Bengali (bn, বাংলা)", "Bodo (brx, बर')", "Dogri (doi, डोगरी)",
     "Gujarati (gu, ગુજરાતી)", "Hindi (hi, हिन्दी)", "Kannada (kn, ಕನ್ನಡ)", "Kashmiri (ks, کٲشُر)",
@@ -52,15 +58,15 @@ INDIAN_LANGUAGES = [
 ]
 
 EXTRACTION_SYSTEM_PROMPT = """You are a multilingual financial entity extractor for an Indian kirana store ledger assistant.
-Input may be in ANY of 23 Indian languages (Assamese, Bengali, Bodo, Dogri, Gujarati, Hindi, Kannada, Kashmiri, Konkani, Maithili, Malayalam, Manipuri, Marathi, Nepali, Odia, Punjabi, Sanskrit, Santali, Sindhi, Tamil, Telugu, Urdu, English) in native script (Devanagari, Bengali-Assamese, Gujarati, Gurmukhi, Kannada, Malayalam, Odia, Tamil, Telugu, Perso-Arabic for Urdu/Kashmiri/Sindhi, Ol Chiki for Santali) OR roman transliteration OR Hinglish/code-mix.
+DEMO MODE: Input will be in ONE of 6 languages: English, Hindi (hi-IN, Devanagari + roman Hinglish), Bengali (bn-IN, Bengali script + roman), Marathi (mr-IN, Devanagari), Tamil (ta-IN, Tamil script + roman), Telugu (te-IN, Telugu script + roman). Other languages are NOT supported yet – if input appears to be another language, still extract best-effort but note language hint.
 
 You MUST extract exactly these 4 fields:
 1. "customerName": Name as it appears (preserve original script/roman). Must not be empty.
 2. "type": Must be either "CREDIT" or "PAYMENT".
-   Lexicon (any language/script/roman): CREDIT = udhar/udhaar/उधार/ઉધાર/বাকি/বাকী/उधारी/கடன்/అప్పు/ಕಡ/കടം/ਉਧਾਰ/ادھار/ବାକି/baki/credit/borrowed/lena/देना; PAYMENT = jama/jamaa/जमा/জমা/జమ/செலுத்தினார்/பணம்/ಕಟ್ಟಿದ/അടച്ചു/ਜਮ੍ਹਾਂ/جمع/paid/cleared/jama/bharla/chukta/diya/wapas/return.
+   Lexicon (demo languages, any script/roman): CREDIT = udhar/udhaar/उधार/বাকি/বাকী/उधारी/கடன்/అప్పు/baki/credit/borrowed/lena/देना; PAYMENT = jama/jamaa/जमा/জমা/జమ/செலுத்தினார்/జమ/paid/cleared/jama/bharla/chukta/diya/wapas/return; Hinglish also jama/bhugtan.
    Infer from context if ambiguous; default CREDIT for ambiguous "took/bought/got" + amount.
-3. "amount": Positive number in Rupees. Normalize: Devanagari ०-९, Bengali ০-৯, Tamil ௦-௯, Telugu ౦-౯, Gujarati ૦-૯, Kannada ೦-೯, Malayalam ൦-൯, Gurmukhi ੦-੯, Odia ୦-୯, Perso-Arabic ۰-۹ → 0-9; words like पांच सौ/পাঁচশত/ஐந்நூறு/ಐನೂರು/ఐదువందల/পাঁচ শত/ennaintru → digits; handle lakh (1L=100000), crore, k (5k=5000), comma 5,000.
-4. "description": Goods note VERBATIM in source language/script as spoken (e.g. Tamil "அரிசி", Hindi "चावल", Bengali "চাল"). Do NOT translate to English. If no goods (e.g. "Rahul paid 300"), use "".
+3. "amount": Positive number in Rupees. Normalize: Devanagari ०-९, Bengali ০-৯, Tamil ௦-௯, Telugu ౦-౯ → 0-9; handle lakh (1L=100000), crore, k (5k=5000), comma 5,000.
+4. "description": Goods note VERBATIM in source language/script as spoken (e.g. Tamil "அரிசி", Hindi "चावल", Bengali "চাল", Telugu "బియ్యం", Marathi "तांदूळ"). Do NOT translate to English. If no goods (e.g. "Rahul paid 300"), use "".
 
 CRITICAL RULES:
 - NEVER calculate or guess customer balances.
@@ -71,65 +77,66 @@ CRITICAL RULES:
 - Do NOT output markdown code blocks (no ```json). Output raw JSON only. Language hint may be provided; trust it but verify from text."""
 
 
-REPLY_SYSTEM_PROMPT = """You are Ledgerly, a friendly kirana store assistant replying via WhatsApp.
-Given a newly recorded transaction and the customer's updated balance, generate a concise WhatsApp reply.
+REPLY_SYSTEM_PROMPT = """You are Ledgerly, a friendly kirana store assistant replying via WhatsApp/Telegram.
+Given a newly recorded transaction and the customer's updated balance, generate a concise reply.
 
 Rules:
 - Keep it 1-2 lines, under 300 characters.
 - Include: customer name, amount with ₹, CREDIT/udhar vs PAYMENT/jama phrasing IN USER'S LANGUAGE, and exact balance provided.
-- Language: Reply in SAME language and SAME script (native vs roman) as the Original shopkeeper note. If Language hint is provided (e.g. hi-IN, ta-IN), prioritize it. If note is Tamil script → reply Tamil script; if Hinglish roman → reply roman Hinglish; if Bengali script → Bengali script. Never default to Hindi for non-Hindi users.
+- DEMO MODE: Supported languages are English (en-IN), Hindi (hi-IN), Bengali (bn-IN), Marathi (mr-IN), Tamil (ta-IN), Telugu (te-IN). Reply in SAME language and SAME script as Original note. If Language hint provided (e.g. hi-IN, ta-IN), prioritize it. If Hindi note → Hindi; Tamil→Tamil; Telugu→Telugu; Bengali→Bengali; Marathi→Marathi. Hinglish roman → roman Hinglish.
 - Never guess or recalculate balance - use the exact balance provided.
-- Use idiomatic terms per language: Hindi उदार/जमा, Bengali বাকি/জমা, Gujarati ઉધાર/જમા, Marathi उधारी/जमा, Tamil கடன்/செலுத்தினார், Telugu అప్పు/జమ, Kannada ಸಾಲ/ಜಮಾ, Malayalam കടം/അടച്ചു, Punjabi ਉਧਾਰ/ਜਮ੍ਹਾਂ, Odia ବାକି/ଜମା, Urdu ادھار/جمع, Assamese বাকী/জমা, etc. For unsupported, use English "credit/payment".
-- For CREDIT: include "udhar/credit/baki" equivalent + "Kul/Balance". For PAYMENT: "jama/paid/jama" + "Bacha/Remaining".
+- Use idiomatic demo terms: Hindi उदार/जमा, Bengali বাকি/জমা, Marathi उधारी/जमा, Tamil கடன்/செலுத்தினார், Telugu అప్పు/జమ, English credit/payment. For unsupported, use English "credit/payment".
+- For CREDIT: include "udhar/credit/baki" equivalent + "Kul/Balance". For PAYMENT: "jama/paid" + "Bacha/Remaining".
 - Add a small emoji (✅ for CREDIT, 🙏 for PAYMENT) at end.
 - Do NOT output JSON, output plain text reply only."""
 
-# Fallback templates per language when Bedrock is unavailable
+# Fallback templates per demo language when Bedrock is unavailable (6 langs + aliases)
 FALLBACK_TEMPLATES = {
     "hi-IN": {"CREDIT": "{name} ke khate me {amt} udhar joda. Kul udhar: {bal}. ✅", "PAYMENT": "{name} ne {amt} jama kiye. Bacha udhar: {bal}. Dhanyavad! 🙏"},
     "en-IN": {"CREDIT": "Recorded {amt} credit for {name}. Total due: {bal}. ✅", "PAYMENT": "Recorded {amt} payment from {name}. Balance: {bal}. Thanks! 🙏"},
     "en": {"CREDIT": "Recorded {amt} credit for {name}. Total due: {bal}. ✅", "PAYMENT": "Recorded {amt} payment from {name}. Balance: {bal}. Thanks! 🙏"},
     "bn-IN": {"CREDIT": "{name}-এর খাতায় {amt} বাকি যোগ হলো। মোট বাকি: {bal}. ✅", "PAYMENT": "{name} {amt} জমা করেছেন। বাকি: {bal}. ধন্যবাদ! 🙏"},
     "bn": {"CREDIT": "{name}-এর খাতায় {amt} বাকি যোগ হলো। মোট বাকি: {bal}. ✅", "PAYMENT": "{name} {amt} জমা করেছেন। বাকি: {bal}. ধন্যবাদ! 🙏"},
-    "gu-IN": {"CREDIT": "{name} ના ખાતામાં {amt} ઉધાર ઉમેરાયું. કુલ બાકી: {bal}. ✅", "PAYMENT": "{name} એ {amt} જમા કર્યા. બાકી: {bal}. આભાર! 🙏"},
-    "gu": {"CREDIT": "{name} ના ખાતામાં {amt} ઉધાર ઉમેરાયું. કુલ બાકી: {bal}. ✅", "PAYMENT": "{name} એ {amt} જમા કર્યા. બાકી: {bal}. આભાર! 🙏"},
-    "kn-IN": {"CREDIT": "{name} ಖಾತೆಗೆ {amt} ಸಾಲ ಸೇರಿಸಲಾಯಿತು. ಒಟ್ಟು ಬಾಕಿ: {bal}. ✅", "PAYMENT": "{name} {amt} ಜಮಾ ಮಾಡಿದರು. ಬಾಕಿ: {bal}. ಧನ್ಯವಾದ! 🙏"},
-    "kn": {"CREDIT": "{name} ಖಾತೆಗೆ {amt} ಸಾಲ ಸೇರಿಸಲಾಯಿತು. ಒಟ್ಟು ಬಾಕಿ: {bal}. ✅", "PAYMENT": "{name} {amt} ಜಮಾ ಮಾಡಿದರು. ಬಾಕಿ: {bal}. ಧನ್ಯವಾದ! 🙏"},
-    "ml-IN": {"CREDIT": "{name}-ന്റെ കണക്കിൽ {amt} കടം ചേർത്തു. ആകെ കടം: {bal}. ✅", "PAYMENT": "{name} {amt} അടച്ചു. ബാക്കി: {bal}. നന്ദി! 🙏"},
-    "ml": {"CREDIT": "{name}-ന്റെ കണക്കിൽ {amt} കടം ചേർത്തു. ആകെ കടം: {bal}. ✅", "PAYMENT": "{name} {amt} അടച്ചു. ബാക്കി: {bal}. നന്ദി! 🙏"},
     "mr-IN": {"CREDIT": "{name} च्या खात्यात {amt} उधारी जोडली. एकूण बाकी: {bal}. ✅", "PAYMENT": "{name} यांनी {amt} जमा केले. बाकी: {bal}. धन्यवाद! 🙏"},
     "mr": {"CREDIT": "{name} च्या खात्यात {amt} उधारी जोडली. एकूण बाकी: {bal}. ✅", "PAYMENT": "{name} यांनी {amt} जमा केले. बाकी: {bal}. धन्यवाद! 🙏"},
-    "pa-IN": {"CREDIT": "{name} ਦੇ ਖਾਤੇ ਵਿੱਚ {amt} ਉਧਾਰ ਜੋੜਿਆ. ਕੁੱਲ ਬਕਾਇਆ: {bal}. ✅", "PAYMENT": "{name} ਨੇ {amt} ਜਮ੍ਹਾਂ ਕਰਵਾਏ. ਬਕਾਇਆ: {bal}. ਧੰਨਵਾਦ! 🙏"},
-    "pa": {"CREDIT": "{name} ਦੇ ਖਾਤੇ ਵਿੱਚ {amt} ਉਧਾਰ ਜੋੜਿਆ. ਕੁੱਲ ਬਕਾਇਆ: {bal}. ✅", "PAYMENT": "{name} ਨੇ {amt} ਜਮ੍ਹਾਂ ਕਰਵਾਏ. ਬਕਾਇਆ: {bal}. ਧੰਨਵਾਦ! 🙏"},
     "ta-IN": {"CREDIT": "{name} கணக்கில் {amt} கடன் சேர்க்கப்பட்டது. மொத்த நிலுவை: {bal}. ✅", "PAYMENT": "{name} {amt} செலுத்தினார். மீதி: {bal}. நன்றி! 🙏"},
     "ta": {"CREDIT": "{name} கணக்கில் {amt} கடன் சேர்க்கப்பட்டது. மொத்த நிலுவை: {bal}. ✅", "PAYMENT": "{name} {amt} செலுத்தினார். மீதி: {bal}. நன்றி! 🙏"},
     "te-IN": {"CREDIT": "{name} ఖాతాలో {amt} అప్పు జోడించారు. మొత్తం బకాయి: {bal}. ✅", "PAYMENT": "{name} {amt} జమ చేశారు. మిగిలిన బకాయి: {bal}. ధన్యవాదాలు! 🙏"},
     "te": {"CREDIT": "{name} ఖాతాలో {amt} అప్పు జోడించారు. మొత్తం బకాయి: {bal}. ✅", "PAYMENT": "{name} {amt} జమ చేశారు. మిగిలిన బకాయి: {bal}. ధన్యవాదాలు! 🙏"},
-    "or-IN": {"CREDIT": "{name} ଖାତାରେ {amt} ବାକି ଯୋଗ ହେଲା। ମୋଟ ବାକି: {bal}. ✅", "PAYMENT": "{name} {amt} ଜମା କଲେ। ବାକି: {bal}. ଧନ୍ୟବାଦ! 🙏"},
-    "or": {"CREDIT": "{name} ଖାତାରେ {amt} ବାକି ଯୋଗ ହେଲା। ମୋଟ ବାକି: {bal}. ✅", "PAYMENT": "{name} {amt} ଜମା କଲେ। ବାକି: {bal}. ଧନ୍ୟବାଦ! 🙏"},
-    "as-IN": {"CREDIT": "{name}ৰ খাতাত {amt} বাকী যোগ হ’ল। মুঠ বাকী: {bal}. ✅", "PAYMENT": "{name}এ {amt} জমা কৰিলে। বাকী: {bal}. ধন্যবাদ! 🙏"},
-    "as": {"CREDIT": "{name}ৰ খাতাত {amt} বাকী যোগ হ’ল। মুঠ বাকী: {bal}. ✅", "PAYMENT": "{name}এ {amt} জমা কৰিলে। বাকী: {bal}. ধন্যবাদ! 🙏"},
-    "ur": {"CREDIT": "{name} کے کھاتے میں {amt} ادھار شامل۔ کل ادھار: {bal}. ✅", "PAYMENT": "{name} نے {amt} جمع کیا۔ باقی: {bal}. شکریہ! 🙏"},
-    "ur-IN": {"CREDIT": "{name} کے کھاتے میں {amt} ادھار شامل۔ کل ادھار: {bal}. ✅", "PAYMENT": "{name} نے {amt} جمع کیا۔ باقی: {bal}. شکریہ! 🙏"},
-    "ne-NP": {"CREDIT": "{name}को खातामा {amt} बाँकी थपियो। कुल बाँकी: {bal}. ✅", "PAYMENT": "{name}ले {amt} जम्मा गरे। बाँकी: {bal}. धन्यवाद! 🙏"},
-    "ne": {"CREDIT": "{name}को खातामा {amt} बाँकी थपियो। कुल बाँकी: {bal}. ✅", "PAYMENT": "{name}ले {amt} जम्मा गरे। बाँकी: {bal}. धन्यवाद! 🙏"},
-    "sd": {"CREDIT": "{name} جي کاتي ۾ {amt} اُڌار شامل۔ ڪل اُڌار: {bal}. ✅", "PAYMENT": "{name} {amt} جمع ڪرايو۔ باقي: {bal}. مهرباني! 🙏"},
-    "sd-IN": {"CREDIT": "{name} جي کاتي ۾ {amt} اُڌار شامل۔ ڪل اُڌار: {bal}. ✅", "PAYMENT": "{name} {amt} جمع ڪرايو۔ باقي: {bal}. مهرباني! 🙏"},
-    "sa": {"CREDIT": "{name} खाते {amt} धारं योजितम्। कुल धारम्: {bal}. ✅", "PAYMENT": "{name} {amt} जमा कृतम्। अवशेष: {bal}. धन्यवादः! 🙏"},
 }
+# Future languages (kept for completeness but not active in demo) – map to nearest demo template
+FALLBACK_TEMPLATES["gu-IN"] = FALLBACK_TEMPLATES["hi-IN"]
+FALLBACK_TEMPLATES["gu"] = FALLBACK_TEMPLATES["hi-IN"]
+FALLBACK_TEMPLATES["kn-IN"] = FALLBACK_TEMPLATES["hi-IN"]
+FALLBACK_TEMPLATES["kn"] = FALLBACK_TEMPLATES["hi-IN"]
+FALLBACK_TEMPLATES["ml-IN"] = FALLBACK_TEMPLATES["hi-IN"]
+FALLBACK_TEMPLATES["ml"] = FALLBACK_TEMPLATES["hi-IN"]
+FALLBACK_TEMPLATES["pa-IN"] = FALLBACK_TEMPLATES["hi-IN"]
+FALLBACK_TEMPLATES["pa"] = FALLBACK_TEMPLATES["hi-IN"]
+FALLBACK_TEMPLATES["or-IN"] = FALLBACK_TEMPLATES["bn-IN"]
+FALLBACK_TEMPLATES["or"] = FALLBACK_TEMPLATES["bn-IN"]
+FALLBACK_TEMPLATES["as-IN"] = FALLBACK_TEMPLATES["bn-IN"]
+FALLBACK_TEMPLATES["as"] = FALLBACK_TEMPLATES["bn-IN"]
+FALLBACK_TEMPLATES["ur"] = FALLBACK_TEMPLATES["hi-IN"]
+FALLBACK_TEMPLATES["ur-IN"] = FALLBACK_TEMPLATES["hi-IN"]
+FALLBACK_TEMPLATES["ne-NP"] = FALLBACK_TEMPLATES["hi-IN"]
+FALLBACK_TEMPLATES["ne"] = FALLBACK_TEMPLATES["hi-IN"]
+FALLBACK_TEMPLATES["sd"] = FALLBACK_TEMPLATES["hi-IN"]
+FALLBACK_TEMPLATES["sd-IN"] = FALLBACK_TEMPLATES["hi-IN"]
+FALLBACK_TEMPLATES["sa"] = FALLBACK_TEMPLATES["hi-IN"]
 FALLBACK_TEMPLATES["kok"] = FALLBACK_TEMPLATES["mr-IN"]
 FALLBACK_TEMPLATES["kok-IN"] = FALLBACK_TEMPLATES["mr-IN"]
 FALLBACK_TEMPLATES["mni"] = FALLBACK_TEMPLATES["bn-IN"]
 FALLBACK_TEMPLATES["mni-IN"] = FALLBACK_TEMPLATES["bn-IN"]
-FALLBACK_TEMPLATES["brx"] = FALLBACK_TEMPLATES["as-IN"]
+FALLBACK_TEMPLATES["brx"] = FALLBACK_TEMPLATES["hi-IN"]
 FALLBACK_TEMPLATES["doi"] = FALLBACK_TEMPLATES["hi-IN"]
-FALLBACK_TEMPLATES["ks"] = FALLBACK_TEMPLATES["ur"]
+FALLBACK_TEMPLATES["ks"] = FALLBACK_TEMPLATES["hi-IN"]
 FALLBACK_TEMPLATES["mai"] = FALLBACK_TEMPLATES["hi-IN"]
 FALLBACK_TEMPLATES["sat"] = FALLBACK_TEMPLATES["bn-IN"]
-# Ensure short ↔ long code both exist for common langs
-for k in ["hi", "bn", "mr", "ta", "te", "as", "gu", "kn", "ml", "pa", "or", "ne", "ur", "sd", "sa", "en"]:
+# Ensure short ↔ long code both exist for demo langs
+for k in ["hi", "bn", "mr", "ta", "te", "en"]:
     short = k
-    long_map = {"hi": "hi-IN", "bn": "bn-IN", "mr": "mr-IN", "ta": "ta-IN", "te": "te-IN", "as": "as-IN", "gu": "gu-IN", "kn": "kn-IN", "ml": "ml-IN", "pa": "pa-IN", "or": "or-IN", "ne": "ne-NP", "ur": "ur-IN", "sd": "sd-IN", "sa": "sa", "en": "en-IN"}
+    long_map = {"hi": "hi-IN", "bn": "bn-IN", "mr": "mr-IN", "ta": "ta-IN", "te": "te-IN", "en": "en-IN"}
     long_code = long_map.get(k, k)
     if short in FALLBACK_TEMPLATES and long_code not in FALLBACK_TEMPLATES:
         FALLBACK_TEMPLATES[long_code] = FALLBACK_TEMPLATES[short]
@@ -137,48 +144,50 @@ for k in ["hi", "bn", "mr", "ta", "te", "as", "gu", "kn", "ml", "pa", "or", "ne"
         FALLBACK_TEMPLATES[short] = FALLBACK_TEMPLATES[long_code]
 
 
+DEMO_DETECT_SET = {"en-IN", "hi-IN", "bn-IN", "mr-IN", "ta-IN", "te-IN"}
+
 def detect_language_from_text(text: str) -> str:
-    """Detects language from Unicode script + keyword heuristic for 23 Indian langs. Returns xx-IN code or en-IN."""
+    """Detects language from Unicode script + keyword heuristic. For demo, correctly identifies all scripts but handler will reject non-demo."""
     if not text or not text.strip():
         return "en-IN"
-    lower_text = text.lower()
-    # Keyword heuristics before script for Devanagari disambiguation
-    # Marathi-specific: उधारी, तांदूळ, खात्यात, जमा केले, एकूण, बाकी (Marathi uses उधारी vs Hindi उधार)
+    # Keyword heuristics for Devanagari disambiguation (hi vs mr)
     if any(kw in text for kw in ["उधारी", "तांदूळ", "खात्यात", "जमा केले", "एकूण", "ळ"]):
         return "mr-IN"
-    # Nepali specific: खातामा, जम्मा, बाँकी
+    # Nepali specific
     if any(kw in text for kw in ["खातामा", "जम्मा", "बाँकी"]):
         return "ne-NP"
-    # Sanskrit specific: धारं, योजितम्, संस्कृत style, but keep hi-IN for Sanskrit fallback
-    # Bengali distinct already via script, but check for Assamese vs Bengali not needed (same script)
-    # Check script blocks priority: native scripts first
+    # Check script blocks: full detection for accurate rejection of non-demo langs
     for ch in text:
         cp = ord(ch)
         if 0x0B80 <= cp <= 0x0BFF:
-            return "ta-IN"  # Tamil
+            return "ta-IN"
         if 0x0C00 <= cp <= 0x0C7F:
-            return "te-IN"  # Telugu
+            return "te-IN"
         if 0x0C80 <= cp <= 0x0CFF:
-            return "kn-IN"  # Kannada
+            return "kn-IN"
         if 0x0D00 <= cp <= 0x0D7F:
-            return "ml-IN"  # Malayalam
+            return "ml-IN"
         if 0x0A80 <= cp <= 0x0AFF:
-            return "gu-IN"  # Gujarati
+            return "gu-IN"
         if 0x0A00 <= cp <= 0x0A7F:
-            return "pa-IN"  # Gurmukhi Punjabi
+            return "pa-IN"
         if 0x0B00 <= cp <= 0x0B7F:
-            return "or-IN"  # Odia
+            return "or-IN"
         if 0x0980 <= cp <= 0x09FF:
-            return "bn-IN"  # Bengali-Assamese
+            return "bn-IN"
         if 0x0600 <= cp <= 0x06FF or 0x0750 <= cp <= 0x077F or 0x08A0 <= cp <= 0x08FF:
-            return "ur"  # Perso-Arabic Urdu/Kashmiri/Sindhi
+            return "ur"
         if 0x1C50 <= cp <= 0x1C7F:
-            return "sat"  # Ol Chiki Santali
+            return "sat"
         if 0x0900 <= cp <= 0x097F:
-            return "hi-IN"  # Devanagari default (covers sa, kok, doi, mai, brx)
-    # If no native script, check for Indic roman keywords? For now default en-IN for Latin
-    # Could detect Hinglish vs English but fallback en-IN is safe; Bedrock will infer
+            return "hi-IN"
+    lower = text.lower()
+    if any(kw in lower for kw in ["jama", "udhar", "udhaar", "baki", "bhaav", "rupaye", "rupya", "bhugtan", "diya", "liya", "kar diya", "ho gaya"]):
+        return "hi-IN"
     return "en-IN"
+
+def is_demo_language_supported(code: str) -> bool:
+    return code in DEMO_DETECT_SET or code in {"en", "hi", "bn", "mr", "ta", "te", "auto"}
 
 
 class BedrockService:

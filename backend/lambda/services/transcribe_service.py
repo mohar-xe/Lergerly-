@@ -47,12 +47,16 @@ class TranscriptionFailedError(TranscribeError):
     pass
 
 
-# 23 Indian official languages mapping
-# AWS supports 12 directly; 4 via Whisper; 6 gap -> fallback to hi-IN with high WER
+# Demo: Top 5 Indian languages + English (others yet to be implemented)
+# MVP languages: en-IN, hi-IN, bn-IN, mr-IN, ta-IN, te-IN
+DEMO_SUPPORTED: List[str] = [
+    "en-IN", "hi-IN", "bn-IN", "mr-IN", "ta-IN", "te-IN",
+]
+# Full 23-language mapping retained for future expansion (not active in demo)
 SUPPORTED_AWS: List[str] = [
     "en-IN", "hi-IN", "bn-IN", "gu-IN", "kn-IN", "ml-IN", "mr-IN", "pa-IN", "ta-IN", "te-IN", "or-IN", "ne-NP"
 ]
-# Short code → AWS code
+# Short code → AWS code (demo subset + future)
 SHORT_TO_AWS: Dict[str, str] = {
     "en": "en-IN", "en-IN": "en-IN",
     "hi": "hi-IN", "hi-IN": "hi-IN",
@@ -66,15 +70,25 @@ SHORT_TO_AWS: Dict[str, str] = {
     "te": "te-IN", "te-IN": "te-IN",
     "or": "or-IN", "or-IN": "or-IN",
     "ne": "ne-NP", "ne-NP": "ne-NP", "ne-IN": "ne-NP",
-    "as": "as", "as-IN": "as",  # Whisper only
+    "as": "as", "as-IN": "as",  # Whisper only (future)
     "ur": "ur", "ur-IN": "ur",
     "sa": "sa", "sa-IN": "sa",
     "sd": "sd", "sd-IN": "sd",
     "auto": "auto",
 }
 
+# Demo helper: is language supported in MVP?
+DEMO_LANG_SET = set(DEMO_SUPPORTED) | {"auto"}
+
+def is_demo_language(code: str) -> bool:
+    """Returns True if language is in demo subset or auto (auto resolves to demo via detection)."""
+    if not code:
+        return False
+    norm = normalize_language_code(code) if code else ""
+    return norm in DEMO_LANG_SET or norm.lower() == "auto"
+
 WHISPER_ONLY = {"as", "as-IN", "sa", "sa-IN", "sd", "sd-IN", "ur", "ur-IN"}
-# Gap langs that have zero ASR (bodo, dogri, ks, kok, mai, mni, sat) -> fallback to hi-IN
+# Gap langs that have zero ASR (bodo, dogri, ks, kok, mai, mni, sat) -> fallback to hi-IN (future)
 GAP_LANGS = {"brx", "bodo", "doi", "dogri", "ks", "kok", "konkani", "mai", "maithili", "mni", "sat", "santali", "bodo"}
 
 # Map gap to nearest phonologically close AWS lang for fallback
@@ -275,7 +289,13 @@ class TranscribeService:
         if not s3_uri or not s3_uri.strip():
             raise TranscriptionFailedError("S3 URI cannot be empty.")
         raw_code = normalize_language_code(language_code)
-        # Whisper-only languages: delegate
+        # Demo enforcement: only allow top 5 + English + auto
+        if raw_code.lower() != "auto" and raw_code not in DEMO_LANG_SET:
+            # Check if normalized without region also not in demo
+            short = raw_code.split("-")[0].lower()
+            if short not in {"en","hi","bn","mr","ta","te"}:
+                raise TranscriptionFailedError(f"Language '{raw_code}' not supported yet (demo: {', '.join(DEMO_SUPPORTED)} + auto)")
+        # Whisper-only languages: delegate (future – not in demo)
         if raw_code in WHISPER_ONLY or raw_code in GAP_LANGS or raw_code in GAP_FALLBACK:
             # Check if whisper provider preferred
             whisper = self._get_whisper_service()
@@ -335,8 +355,8 @@ class TranscribeService:
             }
             if raw_code.lower() == "auto":
                 kwargs["IdentifyLanguage"] = True
-                # Restrict to supported 12 to improve accuracy vs open
-                kwargs["LanguageOptions"] = SUPPORTED_AWS
+                # Restrict to demo 6 to improve accuracy vs open
+                kwargs["LanguageOptions"] = DEMO_SUPPORTED
                 # Optionally: kwargs["LanguageIdSettings"] = {code: {"VocabularyName": "..."} } if custom vocab
             else:
                 # Ensure code is valid AWS code
@@ -398,8 +418,13 @@ class TranscribeService:
             raise TranscriptionFailedError(f"Audio too large ({len(audio_bytes)} bytes > {max_bytes} bytes). Please send a shorter voice note (<60s).")
 
         raw_code = normalize_language_code(language_code)
+        # Demo enforcement: only allow top 5 + English + auto
+        if raw_code.lower() != "auto" and raw_code not in DEMO_LANG_SET:
+            short = raw_code.split("-")[0].lower()
+            if short not in {"en","hi","bn","mr","ta","te"}:
+                raise TranscriptionFailedError(f"Language '{raw_code}' not supported yet (demo: {', '.join(DEMO_SUPPORTED)} + auto)")
 
-        # Direct whisper path for whisper-only langs to avoid S3+Transcribe roundtrip if provider is whisper-first
+        # Direct whisper path for whisper-only langs to avoid S3+Transcribe roundtrip if provider is whisper-first (future)
         if raw_code in WHISPER_ONLY or raw_code in GAP_LANGS or raw_code.lower() in GAP_FALLBACK:
             whisper = self._get_whisper_service()
             # If whisper endpoint configured, use it directly without S3

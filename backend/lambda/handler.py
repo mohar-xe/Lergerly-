@@ -34,6 +34,7 @@ from services.transcribe_service import (
     TranscriptionFailedError,
     normalize_language_code,
     SUPPORTED_AWS,
+    DEMO_SUPPORTED,
 )
 from services.whatsapp_service import (
     WhatsAppService,
@@ -46,6 +47,31 @@ try:
 except ImportError:
     WhisperService = None
     WhisperUnavailableError = WhisperTranscriptionFailedError = Exception
+try:
+    from services.telegram_service import TelegramService, TelegramUnavailableError, TelegramValidationError
+except ImportError:
+    TelegramService = None
+    TelegramUnavailableError = TelegramValidationError = Exception
+try:
+    from services.config import validate_transcribe_config, validate_bedrock_config, ConfigValidationError
+    _config_checked = False
+    def _ensure_config():
+        global _config_checked
+        if _config_checked:
+            return
+        _config_checked = True
+        try:
+            validate_bedrock_config(require_model_id=False)
+        except ConfigValidationError as e:
+            # Log warning but don't crash (allows offline tests)
+            print(f"[Ledgerly] Bedrock config warning: {e}")
+        try:
+            validate_transcribe_config(require_bucket=False)
+        except ConfigValidationError as e:
+            print(f"[Ledgerly] Transcribe config warning: {e}")
+    _ensure_config()
+except Exception:
+    pass
 
 # Shared service instances
 ledger_service = LedgerService()
@@ -53,6 +79,16 @@ bedrock_service = BedrockService()
 whatsapp_service = WhatsAppService()
 transcribe_service = TranscribeService()
 payment_reply_service = PaymentReplyService()
+# Telegram service lazy init
+telegram_service = None
+def _get_telegram_service():
+    global telegram_service
+    if telegram_service is None and TelegramService is not None:
+        try:
+            telegram_service = TelegramService()
+        except Exception:
+            telegram_service = None
+    return telegram_service
 
 
 def _build_response(status_code: int, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -152,30 +188,22 @@ def lambda_handler(event: Dict[str, Any], context: Any = None) -> Dict[str, Any]
         return whatsapp_service.resolve_shop_id(phone_number_id or "")
 
     def _find_or_create_customer(shop_id: str, customer_name: str, fallback_phone: str, preferred_language: Optional[str] = None) -> Dict[str, Any]:
-        """Finds existing customer by name (case-insensitive incl. unicode) or creates new one with language."""
+        """Finds existing customer by exact name (case-insensitive unicode) or creates new one. No fuzzy merge to avoid collisions."""
         try:
             customers = ledger_service.list_customers(shop_id)
         except Exception:
             customers = []
         normalized = customer_name.strip().lower()
-        # Exact case-insensitive match first (unicode-safe)
+        # Exact case-insensitive match only (demo: avoid first-token collisions)
         for c in customers:
             if str(c.get("name", "")).strip().lower() == normalized:
                 # Update preferredLanguage if we have new hint
                 if preferred_language and c.get("preferredLanguage") != preferred_language:
                     try:
-                        # Best-effort update via ledger_service if method exists
                         if hasattr(ledger_service, "update_customer_language"):
                             ledger_service.update_customer_language(c.get("customerId"), preferred_language)
                     except Exception:
                         pass
-                return c
-        # Fuzzy first-token match (supports multilingual names)
-        first_in = normalized.split()[0] if normalized.split() else ""
-        for c in customers:
-            cname = str(c.get("name", "")).strip().lower()
-            first_c = cname.split()[0] if cname.split() else ""
-            if first_in and first_c and first_in == first_c:
                 return c
         # Create new
         phone = fallback_phone.strip() if fallback_phone and fallback_phone.strip() else "+91 00000 00000"
@@ -259,6 +287,12 @@ def lambda_handler(event: Dict[str, Any], context: Any = None) -> Dict[str, Any]
                     media_format = "mp4"
                 elif "wav" in mime:
                     media_format = "wav"
+                elif "aac" in mime:
+                    media_format = "mp4"
+                elif "amr" in mime or "3gp" in mime:
+                    media_format = "mp3"
+                elif "webm" in mime or "flac" in mime:
+                    media_format = "ogg"
                 # Use hint_lang or auto
                 lang_for_stt = hint_lang or env_default_lang or "auto"
                 # transcribe_service now returns (text, detected_lang)
@@ -280,15 +314,29 @@ def lambda_handler(event: Dict[str, Any], context: Any = None) -> Dict[str, Any]
                 transcription_meta["transcript"] = raw_text
                 transcription_meta["detected_language"] = detected_lang
                 transcription_meta["source"] = "transcribe"
-                transcription_meta["stt_provider"] = "transcribe" if detected_lang in SUPPORTED_AWS or detected_lang == "auto" else "whisper_fallback"
+                # Demo: check against demo 6 langs
+                _demo_stt = {"en-IN","hi-IN","bn-IN","mr-IN","ta-IN","te-IN"}
+                transcription_meta["stt_provider"] = "transcribe" if detected_lang in _demo_stt or detected_lang == "auto" else "whisper_fallback"
             except (TranscriptionFailedError, WhatsAppValidationError, WhisperTranscriptionFailedError) as e:
                 error_msg = str(e)
                 try:
-                    # Multilingual error reply via fallback template if possible
                     fallback_lang = normalize_language_code(hint_lang) if hint_lang else "hi-IN"
-                    err_reply = bedrock_service.get_fallback_reply({"customerName": "Customer","type":"CREDIT","amount":0}, 0, language_code=fallback_lang)
-                    # Use generic voice failure in user's lang
-                    whatsapp_service.send_text(from_number, f"Voice note samajh nahi paya: {error_msg}. Kripya dobara bhejein ya text me likhein. 🙏", phone_number_id)
+                    # Demo-supported error messages
+                    _err_templates = {
+                        "hi-IN": f"Voice note samajh nahi paya: {error_msg}. Kripya dobara bhejein ya text me likhein. 🙏",
+                        "en-IN": f"Couldn't understand voice note: {error_msg}. Please resend or type. 🙏",
+                        "en": f"Couldn't understand voice note: {error_msg}. Please resend or type. 🙏",
+                        "bn-IN": f"Voice note bujhte parlam na: {error_msg}. Doya kore abar pathan ba type korun. 🙏",
+                        "bn": f"Voice note bujhte parlam na: {error_msg}. Doya kore abar pathan ba type korun. 🙏",
+                        "mr-IN": f"Voice note samajhla nahi: {error_msg}. Krupaya punha pathva kinva type kara. 🙏",
+                        "mr": f"Voice note samajhla nahi: {error_msg}. Krupaya punha pathva kinva type kara. 🙏",
+                        "ta-IN": f"Voice note puriyavillai: {error_msg}. Meendum anupavum allathu type seyyavum. 🙏",
+                        "ta": f"Voice note puriyavillai: {error_msg}. Meendum anupavum. 🙏",
+                        "te-IN": f"Voice note ardam kaledu: {error_msg}. Dayachesi malli pampandi leda type cheyandi. 🙏",
+                        "te": f"Voice note ardam kaledu: {error_msg}. Dayachesi malli pampandi. 🙏",
+                    }
+                    err_text = _err_templates.get(fallback_lang) or _err_templates.get(fallback_lang.split("-")[0]) or _err_templates["en-IN"]
+                    whatsapp_service.send_text(from_number, err_text, phone_number_id)
                 except Exception:
                     pass
                 return {"message_id": msg_id, "status": "failed", "error": f"Transcription failed: {error_msg}", "from": from_number, "shopId": shop_id, "requested_language": hint_lang}
@@ -371,6 +419,8 @@ def lambda_handler(event: Dict[str, Any], context: Any = None) -> Dict[str, Any]
                     try:
                         customer_txs = ledger_service.get_customer_transactions(customer_id, shop_id=shop_id)
                         existing_tx = next((t for t in customer_txs if t.get("transactionId") == payment_tx_id), None)
+                        if not existing_tx and hasattr(ledger_service, "get_transaction"):
+                            existing_tx = ledger_service.get_transaction(payment_tx_id)
                     except Exception:
                         existing_tx = None
 
@@ -466,13 +516,26 @@ def lambda_handler(event: Dict[str, Any], context: Any = None) -> Dict[str, Any]
                     payment_res["transcription_meta"] = transcription_meta
                 return payment_res
 
+        # Demo: reject non-demo languages early
+        _demo_allowed = {"en-IN", "hi-IN", "bn-IN", "mr-IN", "ta-IN", "te-IN", "en", "hi", "bn", "mr", "ta", "te", "auto"}
+        if norm_lang and norm_lang not in _demo_allowed and norm_lang.split("-")[0] not in {"en","hi","bn","mr","ta","te"}:
+            return {"message_id": msg_id, "status": "failed", "error": f"Language '{norm_lang}' not supported yet (demo: en-IN, hi-IN, bn-IN, mr-IN, ta-IN, te-IN)", "from": from_number, "transcript": raw_text, "detected_language": norm_lang}
         # 2. Bedrock extraction with language hint
         try:
             extracted = bedrock_service.extract_transaction(raw_text.strip(), language_code=norm_lang)
         except BedrockExtractionError as e:
             try:
-                # Send error in detected language if possible
-                whatsapp_service.send_text(from_number, f"Samajh nahi paya: {str(e)}. Kripya naam, rakam aur udhar/jama sahi se bhejein. 🙏", phone_number_id)
+                _ex_templates = {
+                    "hi-IN": f"Samajh nahi paya: {str(e)}. Kripya naam, rakam aur udhar/jama sahi se bhejein. 🙏",
+                    "en-IN": f"Couldn't understand: {str(e)}. Please send name, amount and credit/payment clearly. 🙏",
+                    "en": f"Couldn't understand: {str(e)}. Please send name, amount and credit/payment clearly. 🙏",
+                    "bn-IN": f"Bujhte parlam na: {str(e)}. Doya kore naam, taka ebong baki/joma thik kore pathan. 🙏",
+                    "mr-IN": f"Samajhla nahi: {str(e)}. Krupaya naav, rakam ani udhari/jama vyavasthit pathva. 🙏",
+                    "ta-IN": f"Puriyavillai: {str(e)}. Peyar, thogai matrum kadan/seluthu thelivaga anupavum. 🙏",
+                    "te-IN": f"Ardam kaledu: {str(e)}. Dayachesi peru, motham mariyu appu/jama sarigga pampandi. 🙏",
+                }
+                ex_text = _ex_templates.get(norm_lang) or _ex_templates.get(norm_lang.split("-")[0]) or _ex_templates["en-IN"]
+                whatsapp_service.send_text(from_number, ex_text, phone_number_id)
             except Exception:
                 pass
             return {"message_id": msg_id, "status": "failed", "error": f"Extraction failed: {str(e)}", "from": from_number, "transcript": raw_text, "shopId": shop_id, "detected_language": norm_lang}
@@ -585,6 +648,296 @@ def lambda_handler(event: Dict[str, Any], context: Any = None) -> Dict[str, Any]
         if transcription_meta:
             result["transcription_meta"] = transcription_meta
         return result
+
+    def _process_telegram_single_message(msg: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Processes a single Telegram message (text or voice/audio) through STT -> Bedrock -> Ledger -> Telegram reply.
+        Mirrors WhatsApp flow but uses TelegramService.
+        """
+        tg_service = _get_telegram_service()
+        if tg_service is None:
+            return {"message_id": msg.get("message_id",""), "status": "error", "error": "Telegram service not configured", "code": 503}
+        chat_id = msg.get("chat_id") or msg.get("from", "")
+        from_id = msg.get("from_user_id") or chat_id
+        msg_id = msg.get("message_id", "")
+        mtype = msg.get("type", "")
+        shop_id = tg_service.resolve_shop_id(chat_id)
+        hint_lang = msg.get("language_code") or msg.get("language") or msg.get("lang")
+        env_default_lang = os.environ.get("TRANSCRIBE_LANGUAGE", "auto")
+        if not hint_lang:
+            hint_lang = env_default_lang
+        raw_text = ""
+        detected_lang = hint_lang
+        transcription_meta: Dict[str, Any] = {}
+        if hint_lang:
+            transcription_meta["requested_language"] = hint_lang
+        if mtype == "text":
+            raw_text = str(msg.get("text", "")).strip()
+            if not raw_text:
+                return {"message_id": msg_id, "status": "failed", "error": "Empty text message", "from": chat_id}
+            if not hint_lang or str(hint_lang).strip().lower() == "auto":
+                detected_lang = detect_language_from_text(raw_text)
+            else:
+                detected_lang = normalize_language_code(hint_lang)
+            transcription_meta["detected_language"] = detected_lang
+            transcription_meta["source"] = "text"
+            transcription_meta["language_detection"] = "script_heuristic" if (not hint_lang or str(hint_lang).lower()=="auto") else "explicit_hint"
+        elif mtype in ("audio", "voice"):
+            audio_id = msg.get("audio_id", "")
+            if not audio_id:
+                return {"message_id": msg_id, "status": "failed", "error": "Missing audio id", "from": chat_id}
+            try:
+                audio_bytes = tg_service.download_media(audio_id)
+                transcription_meta["audio_bytes_len"] = len(audio_bytes)
+                mime = str(msg.get("mime_type", "audio/ogg")).lower()
+                media_format = "ogg"
+                if "mpeg" in mime or "mp3" in mime:
+                    media_format = "mp3"
+                elif "mp4" in mime:
+                    media_format = "mp4"
+                elif "wav" in mime:
+                    media_format = "wav"
+                elif "aac" in mime:
+                    media_format = "mp4"
+                elif "amr" in mime:
+                    media_format = "mp3"
+                lang_for_stt = hint_lang or env_default_lang or "auto"
+                result = transcribe_service.transcribe_audio_bytes(audio_bytes, media_format=media_format, language_code=lang_for_stt)
+                if isinstance(result, tuple) and len(result) == 2:
+                    raw_text, detected_lang = result
+                elif isinstance(result, str):
+                    raw_text = result
+                    detected_lang = normalize_language_code(lang_for_stt)
+                else:
+                    raw_text = str(result)
+                    detected_lang = normalize_language_code(lang_for_stt)
+                if not detected_lang or str(detected_lang).lower() == "auto":
+                    heuristic = detect_language_from_text(raw_text)
+                    if heuristic != "en-IN" or not detected_lang:
+                        detected_lang = heuristic
+                        transcription_meta["language_detection"] = "script_heuristic_post_stt"
+                transcription_meta["transcript"] = raw_text
+                transcription_meta["detected_language"] = detected_lang
+                transcription_meta["source"] = "transcribe"
+                _demo_stt = {"en-IN","hi-IN","bn-IN","mr-IN","ta-IN","te-IN"}
+                transcription_meta["stt_provider"] = "transcribe" if detected_lang in _demo_stt or detected_lang == "auto" else "whisper_fallback"
+            except (TranscriptionFailedError, TelegramValidationError, WhisperTranscriptionFailedError) as e:
+                error_msg = str(e)
+                try:
+                    fallback_lang = normalize_language_code(hint_lang) if hint_lang else "hi-IN"
+                    _err_templates = {
+                        "hi-IN": f"Voice note samajh nahi paya: {error_msg}. Kripya dobara bhejein ya text me likhein. 🙏",
+                        "en-IN": f"Couldn't understand voice note: {error_msg}. Please resend or type. 🙏",
+                        "en": f"Couldn't understand voice note: {error_msg}. Please resend or type. 🙏",
+                        "bn-IN": f"Voice note bujhte parlam na: {error_msg}. Doya kore abar pathan ba type korun. 🙏",
+                        "mr-IN": f"Voice note samajhla nahi: {error_msg}. Krupaya punha pathva kinva type kara. 🙏",
+                        "ta-IN": f"Voice note puriyavillai: {error_msg}. Meendum anupavum. 🙏",
+                        "te-IN": f"Voice note ardam kaledu: {error_msg}. Dayachesi malli pampandi. 🙏",
+                    }
+                    err_text = _err_templates.get(fallback_lang) or _err_templates.get(fallback_lang.split("-")[0]) or _err_templates["en-IN"]
+                    tg_service.send_text(chat_id, err_text)
+                except Exception:
+                    pass
+                return {"message_id": msg_id, "status": "failed", "error": f"Transcription failed: {error_msg}", "from": chat_id, "shopId": shop_id, "requested_language": hint_lang}
+            except (TranscribeUnavailableError, WhisperUnavailableError, TelegramUnavailableError) as e:
+                error_msg = str(e)
+                return {"message_id": msg_id, "status": "error", "error": f"Service unavailable: {error_msg}", "from": chat_id, "shopId": shop_id, "code": 503, "requested_language": hint_lang}
+            except Exception as e:
+                return {"message_id": msg_id, "status": "error", "error": f"Transcription error: {str(e)}", "from": chat_id, "shopId": shop_id, "code": 503}
+        else:
+            return {"message_id": msg_id, "status": "skipped", "error": f"Unsupported message type '{mtype}'", "from": chat_id}
+        if not raw_text or not raw_text.strip():
+            return {"message_id": msg_id, "status": "failed", "error": "Transcript/text is empty", "from": chat_id, "detected_language": detected_lang}
+        if not detected_lang or str(detected_lang).lower() == "auto":
+            detected_lang = detect_language_from_text(raw_text)
+        norm_lang = normalize_language_code(detected_lang) if detected_lang else "auto"
+        if norm_lang.lower() == "auto":
+            norm_lang = detect_language_from_text(raw_text)
+        _demo_allowed = {"en-IN", "hi-IN", "bn-IN", "mr-IN", "ta-IN", "te-IN", "en", "hi", "bn", "mr", "ta", "te", "auto"}
+        if norm_lang and norm_lang not in _demo_allowed and norm_lang.split("-")[0] not in {"en","hi","bn","mr","ta","te"}:
+            return {"message_id": msg_id, "status": "failed", "error": f"Language '{norm_lang}' not supported yet (demo: en-IN, hi-IN, bn-IN, mr-IN, ta-IN, te-IN)", "from": chat_id, "transcript": raw_text, "detected_language": norm_lang}
+        supplied_name = msg.get("customerName") or msg.get("name") or msg.get("sender_name")
+        payment_check = payment_reply_service.parse(raw_text.strip(), customer_name=supplied_name, language=norm_lang)
+        if payment_check is not None:
+            if payment_check.get("action") == "AMBIGUOUS":
+                clarification = "Please specify the payment amount (e.g. 'I paid ₹500')."
+                if norm_lang and norm_lang.startswith("hi"):
+                    clarification = "Kripya bhugtan ki rakam batayein (jaise: 'paid 500'). 🙏"
+                elif norm_lang and norm_lang.startswith("bn"):
+                    clarification = "Doya kore takar poriman jan an (jemon: 'paid 500'). 🙏"
+                elif norm_lang and norm_lang.startswith("mr"):
+                    clarification = "Krupaya rakam sanga (udaa: 'paid 500'). 🙏"
+                elif norm_lang and norm_lang.startswith("ta"):
+                    clarification = "Thogaiyai kuripidavum (udaa: 'paid 500'). 🙏"
+                elif norm_lang and norm_lang.startswith("te"):
+                    clarification = "Motham cheppandi (udaa: 'paid 500'). 🙏"
+                wa_send_status = "skipped"
+                wa_response = None
+                try:
+                    if tg_service.bot_token and chat_id:
+                        wa_response = tg_service.send_text(chat_id, clarification)
+                        wa_send_status = "sent"
+                    else:
+                        wa_send_status = "skipped_no_token"
+                except Exception as e:
+                    wa_send_status = f"failed: {str(e)}"
+                ambiguous_res: Dict[str, Any] = {"message_id": msg_id, "status": "ambiguous", "from": chat_id, "shopId": shop_id, "type": mtype, "transcript": raw_text, "detected_language": norm_lang, "paymentIntent": payment_check, "reply": clarification, "whatsapp_send": wa_send_status, "telegram_send": wa_send_status}
+                if wa_response:
+                    ambiguous_res["telegram_response"] = wa_response
+                if transcription_meta:
+                    ambiguous_res["transcription_meta"] = transcription_meta
+                return ambiguous_res
+            if payment_check.get("action") == "PAYMENT":
+                customer = _find_customer_by_phone(shop_id, chat_id)
+                if not customer:
+                    cust_name = supplied_name or (f"Customer ({chat_id})" if chat_id else "Customer")
+                    customer = _find_or_create_customer(shop_id, cust_name, chat_id, preferred_language=norm_lang)
+                customer_id = customer.get("customerId", "")
+                payment_tx_id = f"tg_{msg_id}" if msg_id else None
+                existing_tx = None
+                if payment_tx_id:
+                    try:
+                        customer_txs = ledger_service.get_customer_transactions(customer_id, shop_id=shop_id)
+                        existing_tx = next((t for t in customer_txs if t.get("transactionId") == payment_tx_id), None)
+                        if not existing_tx and hasattr(ledger_service, "get_transaction"):
+                            existing_tx = ledger_service.get_transaction(payment_tx_id)
+                    except Exception:
+                        existing_tx = None
+                is_duplicate = False
+                if existing_tx:
+                    transaction = existing_tx
+                    balance = ledger_service.calculate_customer_balance(customer_id, shop_id=shop_id)
+                    is_duplicate = True
+                else:
+                    payment_amount = payment_check["amount"]
+                    try:
+                        transaction = ledger_service.add_transaction(shop_id=shop_id, customer_id=customer_id, tx_type="PAYMENT", amount=payment_amount, description="Customer payment via Telegram", transaction_id=payment_tx_id, language=norm_lang)
+                        balance = transaction.get("updatedCustomerBalance", 0)
+                    except TypeError as te:
+                        if "language" in str(te):
+                            transaction = ledger_service.add_transaction(shop_id=shop_id, customer_id=customer_id, tx_type="PAYMENT", amount=payment_amount, description="Customer payment via Telegram", transaction_id=payment_tx_id)
+                            balance = transaction.get("updatedCustomerBalance", 0)
+                        else:
+                            code = 503 if isinstance(te, DynamoDBUnavailableError) else 400
+                            return {"message_id": msg_id, "status": "error" if code == 503 else "failed", "error": str(te), "from": chat_id, "paymentIntent": payment_check, "transcript": raw_text, "code": code, "detected_language": norm_lang}
+                    except (LedgerValidationError, DynamoDBUnavailableError) as e:
+                        code = 503 if isinstance(e, DynamoDBUnavailableError) else 400
+                        return {"message_id": msg_id, "status": "error" if code == 503 else "failed", "error": str(e), "from": chat_id, "paymentIntent": payment_check, "transcript": raw_text, "code": code, "detected_language": norm_lang}
+                    except Exception as e:
+                        return {"message_id": msg_id, "status": "error", "error": f"Ledger error: {str(e)}", "from": chat_id, "paymentIntent": payment_check, "transcript": raw_text, "detected_language": norm_lang}
+                extracted_for_reply = {"customerName": customer.get("name", "Customer"), "type": "PAYMENT", "amount": payment_check["amount"], "description": "Customer payment via Telegram"}
+                try:
+                    reply_text = bedrock_service.generate_reply(extracted_for_reply, balance, raw_text, language_code=norm_lang)
+                except Exception:
+                    try:
+                        reply_text = bedrock_service.get_fallback_reply(extracted_for_reply, balance, language_code=norm_lang)
+                    except Exception:
+                        reply_text = f"Payment of ₹{payment_check['amount']} recorded. Remaining balance: ₹{balance}."
+                wa_send_status = "skipped"
+                wa_response = None
+                try:
+                    if tg_service.bot_token and chat_id:
+                        wa_response = tg_service.send_text(chat_id, reply_text)
+                        wa_send_status = "sent"
+                    else:
+                        wa_send_status = "skipped_no_token"
+                except (TelegramUnavailableError, TelegramValidationError) as e:
+                    wa_send_status = f"failed: {str(e)}"
+                except Exception as e:
+                    wa_send_status = f"failed: {str(e)}"
+                payment_res: Dict[str, Any] = {"message_id": msg_id, "status": "processed", "from": chat_id, "shopId": shop_id, "type": mtype, "transcript": raw_text, "detected_language": norm_lang, "paymentIntent": payment_check, "customer": {"customerId": customer.get("customerId"), "name": customer.get("name")}, "transaction": transaction, "balance": balance, "reply": reply_text, "reply_language": norm_lang, "telegram_send": wa_send_status}
+                if is_duplicate:
+                    payment_res["duplicate"] = True
+                if wa_response:
+                    payment_res["telegram_response"] = wa_response
+                if transcription_meta:
+                    payment_res["transcription_meta"] = transcription_meta
+                return payment_res
+        try:
+            extracted = bedrock_service.extract_transaction(raw_text.strip(), language_code=norm_lang)
+        except BedrockExtractionError as e:
+            try:
+                _ex_templates = {
+                    "hi-IN": f"Samajh nahi paya: {str(e)}. Kripya naam, rakam aur udhar/jama sahi se bhejein. 🙏",
+                    "en-IN": f"Couldn't understand: {str(e)}. Please send name, amount and credit/payment clearly. 🙏",
+                    "bn-IN": f"Bujhte parlam na: {str(e)}. Doya kore naam, taka ebong baki/joma thik kore pathan. 🙏",
+                    "mr-IN": f"Samajhla nahi: {str(e)}. Krupaya naav, rakam ani udhari/jama vyavasthit pathva. 🙏",
+                    "ta-IN": f"Puriyavillai: {str(e)}. Peyar, thogai matrum kadan/seluthu thelivaga anupavum. 🙏",
+                    "te-IN": f"Ardam kaledu: {str(e)}. Dayachesi peru, motham mariyu appu/jama sarigga pampandi. 🙏",
+                }
+                ex_text = _ex_templates.get(norm_lang) or _ex_templates.get(norm_lang.split("-")[0]) or _ex_templates["en-IN"]
+                tg_service.send_text(chat_id, ex_text)
+            except Exception:
+                pass
+            return {"message_id": msg_id, "status": "failed", "error": f"Extraction failed: {str(e)}", "from": chat_id, "transcript": raw_text, "shopId": shop_id, "detected_language": norm_lang}
+        except BedrockUnavailableError as e:
+            return {"message_id": msg_id, "status": "error", "error": f"Bedrock unavailable: {str(e)}", "from": chat_id, "transcript": raw_text, "code": 503, "detected_language": norm_lang}
+        try:
+            customer = _find_or_create_customer(shop_id, extracted["customerName"], chat_id, preferred_language=norm_lang)
+            customer_id = customer.get("customerId", "")
+            tx_id = f"tg_{msg_id}" if msg_id else None
+            existing_tx = None
+            if tx_id:
+                try:
+                    customer_txs = ledger_service.get_customer_transactions(customer_id, shop_id=shop_id)
+                    existing_tx = next((t for t in customer_txs if t.get("transactionId") == tx_id), None)
+                    if not existing_tx and hasattr(ledger_service, "get_transaction"):
+                        existing_tx = ledger_service.get_transaction(tx_id)
+                except Exception:
+                    existing_tx = None
+            is_duplicate = False
+            if existing_tx:
+                transaction = existing_tx
+                balance = ledger_service.calculate_customer_balance(customer_id, shop_id=shop_id)
+                is_duplicate = True
+            else:
+                transaction = ledger_service.add_transaction(shop_id=shop_id, customer_id=customer_id, tx_type=extracted["type"], amount=extracted["amount"], description=extracted.get("description", ""), transaction_id=tx_id, language=norm_lang)
+                balance = transaction.get("updatedCustomerBalance", 0)
+        except TypeError as e:
+            if "language" in str(e) or "transaction_id" in str(e):
+                try:
+                    transaction = ledger_service.add_transaction(shop_id=shop_id, customer_id=customer_id, tx_type=extracted["type"], amount=extracted["amount"], description=extracted.get("description", ""), transaction_id=tx_id)
+                    balance = transaction.get("updatedCustomerBalance", 0)
+                except Exception as e2:
+                    code = 503 if isinstance(e2, DynamoDBUnavailableError) else 400
+                    return {"message_id": msg_id, "status": "error" if code == 503 else "failed", "error": str(e2), "from": chat_id, "extracted": extracted, "transcript": raw_text, "code": code, "detected_language": norm_lang}
+            else:
+                code = 503 if isinstance(e, DynamoDBUnavailableError) else 400
+                return {"message_id": msg_id, "status": "error" if code == 503 else "failed", "error": str(e), "from": chat_id, "extracted": extracted, "transcript": raw_text, "code": code, "detected_language": norm_lang}
+        except (LedgerValidationError, DynamoDBUnavailableError) as e:
+            code = 503 if isinstance(e, DynamoDBUnavailableError) else 400
+            return {"message_id": msg_id, "status": "error" if code == 503 else "failed", "error": str(e), "from": chat_id, "extracted": extracted, "transcript": raw_text, "code": code, "detected_language": norm_lang}
+        except Exception as e:
+            return {"message_id": msg_id, "status": "error", "error": f"Ledger error: {str(e)}", "from": chat_id, "extracted": extracted, "transcript": raw_text, "detected_language": norm_lang}
+        try:
+            reply_text = bedrock_service.generate_reply(extracted, balance, raw_text, language_code=norm_lang)
+        except Exception:
+            try:
+                reply_text = bedrock_service.get_fallback_reply(extracted, balance, language_code=norm_lang)
+            except Exception:
+                typ = extracted.get("type", "")
+                amt = extracted.get("amount", "")
+                reply_text = f"{extracted.get('customerName')} ke liye {amt} ({typ}) record kiya. Balance: {balance}. ✅"
+        wa_send_status = "skipped"
+        wa_response = None
+        try:
+            if tg_service.bot_token and chat_id:
+                wa_response = tg_service.send_text(chat_id, reply_text)
+                wa_send_status = "sent"
+            else:
+                wa_send_status = "skipped_no_token"
+        except (TelegramUnavailableError, TelegramValidationError) as e:
+            wa_send_status = f"failed: {str(e)}"
+        except Exception as e:
+            wa_send_status = f"failed: {str(e)}"
+        result2: Dict[str, Any] = {"message_id": msg_id, "status": "processed", "from": chat_id, "shopId": shop_id, "type": mtype, "transcript": raw_text, "detected_language": norm_lang, "extractedTransaction": extracted, "customer": {"customerId": customer.get("customerId"), "name": customer.get("name")}, "transaction": transaction, "balance": balance, "reply": reply_text, "reply_language": norm_lang, "telegram_send": wa_send_status}
+        if is_duplicate:
+            result2["duplicate"] = True
+        if wa_response:
+            result2["telegram_response"] = wa_response
+        if transcription_meta:
+            result2["transcription_meta"] = transcription_meta
+        return result2
 
     try:
         # ---------------------------------------------------------------------
@@ -713,6 +1066,42 @@ def lambda_handler(event: Dict[str, Any], context: Any = None) -> Dict[str, Any]
                 return _build_response(code, {"success": False, "error": str(e), "requested_language": language_code})
             except Exception as e:
                 return _build_response(500, {"success": False, "error": "Transcription error", "details": str(e)})
+
+        # ---------------------------------------------------------------------
+        # ROUTE: Telegram – GET /telegram/webhook (health/verify) & POST /telegram/webhook
+        # ---------------------------------------------------------------------
+        if path in ("/telegram/webhook", "/telegram") and http_method == "GET":
+            # Health check for webhook setup
+            return _build_response(200, {"success": True, "status": "telegram_webhook_ok", "demo_languages": ["en-IN","hi-IN","bn-IN","mr-IN","ta-IN","te-IN"]})
+
+        if path in ("/telegram/webhook", "/telegram") and http_method == "POST":
+            tg_service = _get_telegram_service()
+            # Optional secret token verification
+            if tg_service is not None:
+                headers = event.get("headers", {}) or {}
+                query = query_params
+                ok, msg = tg_service.verify_webhook(headers, query)
+                if not ok:
+                    return _build_response(403, {"success": False, "error": msg})
+            is_valid, body, status_code = _extract_and_validate_body(event)
+            if not is_valid:
+                return _build_response(status_code, body)
+            # Telegram may send update without "message" (e.g. inline_query) -> ack
+            try:
+                tg_service_inst = _get_telegram_service()
+                if tg_service_inst is None:
+                    return _build_response(503, {"success": False, "error": "Telegram service not configured (TELEGRAM_BOT_TOKEN)"})
+                parsed_messages = tg_service_inst.parse_webhook(body)
+            except TelegramValidationError as e:
+                return _build_response(200, {"success": True, "status": "ignored", "reason": str(e)})
+            if not parsed_messages:
+                return _build_response(200, {"success": True, "status": "received", "processed": 0, "reason": "No messages (likely inline_query/callback)"})
+            results = []
+            for m in parsed_messages:
+                res = _process_telegram_single_message(m)
+                results.append(res)
+            # Telegram expects 200 to stop retries, even on errors
+            return _build_response(200, {"success": True, "status": "processed", "count": len(results), "results": results})
 
         # ---------------------------------------------------------------------
         # ROUTE: POST /customers
@@ -883,16 +1272,17 @@ def lambda_handler(event: Dict[str, Any], context: Any = None) -> Dict[str, Any]
             if not clean_message:
                 return _build_response(400, {"success": False, "error": "Field 'message' cannot be empty"})
 
-            # Extract structured transaction via Bedrock with language hint (multilingual 23 langs)
-            # Accept optional language_code / language from body; if missing, detect from script
+            # Extract structured transaction via Bedrock with demo language enforcement
             req_lang = body.get("language_code") or body.get("languageCode") or body.get("language") or body.get("lang")
             if req_lang:
                 norm_lang = normalize_language_code(req_lang)
                 detected_for_resp = norm_lang
             else:
-                # Auto-detect from text script for better extraction & response
                 detected_for_resp = detect_language_from_text(clean_message)
                 norm_lang = detected_for_resp
+            _demo_allowed_msg = {"en-IN", "hi-IN", "bn-IN", "mr-IN", "ta-IN", "te-IN", "en", "hi", "bn", "mr", "ta", "te", "auto"}
+            if norm_lang and norm_lang not in _demo_allowed_msg and norm_lang.split("-")[0] not in {"en","hi","bn","mr","ta","te"}:
+                return _build_response(400, {"success": False, "error": f"Language '{norm_lang}' not supported yet (demo: en-IN, hi-IN, bn-IN, mr-IN, ta-IN, te-IN)"})
             extracted_tx = bedrock_service.extract_transaction(clean_message, language_code=norm_lang)
 
             resp_payload: Dict[str, Any] = {
@@ -973,6 +1363,19 @@ def lambda_handler(event: Dict[str, Any], context: Any = None) -> Dict[str, Any]
         )
 
     except WhatsAppValidationError as e:
+        return _build_response(400, {"success": False, "error": str(e)})
+
+    except TelegramUnavailableError as e:
+        return _build_response(
+            503,
+            {
+                "success": False,
+                "error": "Telegram Bot API is unavailable or not configured. Ensure TELEGRAM_BOT_TOKEN is configured.",
+                "details": str(e),
+            },
+        )
+
+    except TelegramValidationError as e:
         return _build_response(400, {"success": False, "error": str(e)})
 
     except DynamoDBUnavailableError as e:
